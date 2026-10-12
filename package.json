@@ -1,14 +1,31 @@
 {
   "name": "pi-bob-code",
   "version": "0.1.0",
-  "description": "Bob 五站流水线 for pi：编码改动强制过 侦察→对抗验证→修复→门禁 的质量闸（pi 扩展，改编自 Kingo 的 digitaltwin bob-pipeline）",
-  "keywords": ["pi-package", "pi", "code-review", "quality-gate"],
+  "description": "A pi extension that gates every code change behind a five-step review pipeline: scout, adversarial verification, fix, gate, report.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "code-review",
+    "quality-gate"
+  ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Gang-of-Beads/pi-bob-code.git"
+  },
+  "homepage": "https://github.com/Gang-of-Beads/pi-bob-code#readme",
   "type": "module",
   "pi": {
-    "extensions": ["extensions"]
+    "extensions": [
+      "extensions"
+    ]
   },
-  "files": ["extensions", "workflows", "README.md"],
+  "files": [
+    "extensions",
+    "workflows",
+    "README.md"
+  ],
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   }

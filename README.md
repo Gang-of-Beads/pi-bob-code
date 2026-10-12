@@ -1,33 +1,36 @@
 # pi-bob-code
 
-Bob 五站流水线的 pi 扩展版：**编码改动强制过体检，收工前门禁拦截**。
+A [pi](https://github.com/earendil-works/pi) extension that puts every code change through review before the agent may finish: **edit source, and the finish is gated until a five-step pipeline has checked the change and the gate command is green**.
+
+## What it does
 
 ```
-编辑 src/ 落盘 ──→ 埋 bob-pending 标记
-收工（agent_settled）──检测到标记──→ 拦停，注入 /bob 指令
-/bob 流水线：
-  ① 侦察（并行：规格审计 / 清洁透镜 / 硬化站，≤8 路）
-  ② 对抗验证（每条发现一个怀疑者，默认反驳，≤4 条存活）
-  ③ 修复（单一修复者顺序落地，变异锚点逐字保留）
-  ④ 门禁（verifyCommand 全绿，失败进修复环 ≤2 轮）
-  ⑤ 汇报 + 独立复核
+An edit under srcPaths ──→ sets the .git/bob-pending marker
+The agent tries to finish (agent_settled) ──marker found──→ stopped; the pipeline instructions are injected
+The bob pipeline (a pi-subagents workflow, workflows/bob-pipeline.js):
+  1. Scout      parallel read-only reviews: spec (do the test assertions keep their promise),
+                cleanliness (chunkSize files each), hardening (only when the change touches writePaths)
+  2. Verify     each finding goes to a skeptic whose job is to refute it; at most maxFindings
+                go in, the rest are reported as deferred
+  3. Fix        one fixer applies the confirmed findings in order (anchor lines kept verbatim, no tests run)
+  4. Gate       a QA subagent runs verifyCommand; red goes back to the fixer, at most twice
+  5. Report     the main session lists what was confirmed, refuted and fixed and the gate result,
+                then runs verifyCommand again itself as a second vote
 ```
 
-改编自 [Kingo Liang](https://github.com/) 为其 digitaltwin 项目写的 Claude Code bob 套件
-（`.claude/hooks` + `/bob` 命令 + 五站 workflow），通用化为 pi 扩展：
-仓库路径、门禁命令、子代理、写路径、架构不变量全部抽到 `bob.config.json`。
+Why the adversarial step: scouts report many plausible problems. Each finding goes on its own to a skeptic told to refute it. A quote that is not in the file, a problem unrelated to this change, a fix that touches an anchor line or breaks an invariant, a change for its own sake: any one of these rejects it. Only findings the skeptic would vouch for reach the fixer. In the reviews run on [PI WEB](https://github.com/Gang-of-Beads/pi-web), more than half of the findings were rejected at this step.
 
-## 安装
+## Install
 
 ```bash
-pi install git:github.com/VincentHanxiaoDu/pi-bob-code
+pi install git:github.com/Gang-of-Beads/pi-bob-code
 ```
 
-或手动克隆后把 `extensions/` 路径加进 `~/.pi/agent/settings.json` 的 `extensions` 数组。
+It needs [pi-subagents](https://github.com/nicobailon/pi-subagents): the pipeline is a pi-subagents workflow script, and the subagent names must match agents registered there (by default `scout` scouts, verifies and runs QA; `worker` fixes).
 
-## 配置（可选）
+## Configure (optional)
 
-项目根放 `bob.config.json`（或 `.pi/bob.config.json`），全部字段可选：
+Put `bob.config.json` (or `.pi/bob.config.json`) at the project root. Every field is optional:
 
 ```json
 {
@@ -40,47 +43,57 @@ pi install git:github.com/VincentHanxiaoDu/pi-bob-code
   "maxFindings": 4,
   "chunkSize": 3,
   "anchorsPath": "test/mutation.ts",
-  "archRules": "tasks/evidence 写只走 src/api/actions.ts；verifier 不得 import runner"
+  "archRules": "writes to tasks/evidence go only through src/api/actions.ts; the verifier never imports the runner",
+  "extraWriteTools": []
 }
 ```
 
-- `srcPaths`：命中即埋待检标记的路径前缀
-- `writePaths`：命中才上"硬化站"（对抗审查最贵，不浪费在文案改动上）
-- `verifyCommand`：门禁命令（QA 子代理执行，你也手工复核同一条）
-- `anchorsPath`：变异测试锚点文件，存在则修复必须逐字保留锚点行
-- `archRules`：架构不变量，违反的发现直接被怀疑者否决
+- `srcPaths`: an edit under one of these path prefixes sets the pending marker (so does a path containing `/test/`)
+- `writePaths`: only a change that touches one of these gets the hardening step (concurrency, boundaries, cancellation, idempotency); it is the most expensive step, so it is not spent on wording changes
+- `verifyCommand`: the gate command; the QA subagent runs it and the main session runs it again
+- `anchorsPath`: a mutation-test anchor file; when present, fixes must keep its anchor lines verbatim
+- `archRules`: architecture invariants; a finding or a fix that breaks one is rejected
+- `extraWriteTools`: tool names that also count as writing a file, besides `write`, `edit`, `apply_patch` and `multiedit`
 
-子代理名需与 [pi-subagents](https://github.com/nicobailon/pi-subagents) 里注册的 agent 一致
-（默认 `scout` 做侦察/对抗/QA，`worker` 做修复）。
+A real example, abridged from the [PI WEB](https://github.com/Gang-of-Beads/pi-web) repository's `bob.config.json`:
 
-## 命令
+```json
+{
+  "srcPaths": ["src/", "pi-web-plugins/", "extensions/"],
+  "writePaths": ["src/server/", "src/shared/", "src/client/src/controllers/", "src/client/src/api/", "src/client/src/sync/"],
+  "verifyCommand": "pnpm run verify",
+  "maxFindings": 4,
+  "chunkSize": 3,
+  "archRules": "src/server/web/ never imports src/server/daemon/ and the reverse; a plugin under pi-web-plugins/ imports nothing from the host source; no state is decided by comparing display text; no new inline comments."
+}
+```
 
-| 命令 | 作用 |
+When it starts the pipeline, the main session may also override `verifyCommand`, `maxFindings`, `fixerAgent` and `archRules` per run in `args.config`, and pass `repoPath`. Writing the change's design notes and a list of suspicions to hunt into `archRules` makes the review noticeably sharper.
+
+## Commands
+
+| Command | What it does |
 |---|---|
-| `/bob` | 手动跑五站流水线体检当前改动 |
-| `/bob-done` | 清标记，明确豁免本轮体检 |
+| `/bob` | Run the pipeline on the current changes by hand |
+| `/bob-done` | Clear the markers, explicitly waiving this round's check |
 
-## 与原版（Claude Code）的差异
+## Known issues
 
-| 原版 | 本插件 |
-|---|---|
-| PostToolUse / Stop hooks（`settings.json`） | `tool_call` / `agent_settled` 事件 |
-| `.git/bob-pending` 标记 + bash 脚本 | 同机制，pi 事件驱动，无 bash 依赖 |
-| `Workflow` 工具（`agent()`/`parallel()`/`phase()`） | pi-subagents `runs.run`/`runs.all` |
-| 结构化输出 schema | 子代理回纯 JSON 文本，流水线宽松解析 |
-| 硬编码 digitaltwin 仓库路径/锚点/不变量 | 全部进 `bob.config.json` |
+Found over several weeks of daily use on PI WEB, and not fixed yet:
 
-## 已知共存问题
+- **The "pipeline is running" pass never applies.** The extension reads the *contents* of `.git/bob-running` as a timestamp, while the gate tells the main session to `touch` the file. An empty file reads as 0 and always counts as stale, so while the pipeline runs, every finish is gated again, including the fixer's own. Reading the file's modification time instead, or writing `Date.now()` into it, would fix it.
+- **The fixer's session loads the extension too.** When the fixer edits a file under `srcPaths`, its own finish is gated, and it asks the main session what to do. Answer that the main session owns the gate, and that the fixer should run no tests and start nothing.
+- **The QA subagent's environment can differ from the main session's** (PATH, package-manager version), so the gate can go red because of the environment rather than the code. That is why step 5's independent run matters: when the two votes disagree, trust the independent run and find out why.
+- **The gate asks the main session to wait for the pipeline**, so the session is blocked until the pipeline ends or the user sends a new message.
 
-- **pi-multi-account**：切账户会替换会话，旧实例的 `agent_settled` 偶发打印一条 stale 日志。
-  属良性竞态：待检标记持久在 `.git/`，新会话的新实例自愈（下次编码改动照常拦截）。
-  插件侧已把 stale 降级为静默（`assertActive` 抛错即放弃本轮注入）。
+## Design notes
 
-## 设计取舍
+- **Markers live in `.git/`**: outside the working tree and never tracked. Without `.git`, they fall back to `.pi/`.
+- **The gate is an `agent_settled` handler that injects a follow-up turn** rather than a hard block: in pi's event model, stopping a finish means starting another turn, which keeps it out of the way of auto-compaction and retries.
+- **A 30-minute staleness window**: markers left behind by a crashed session stop gating after half an hour.
+- **JSON in text rather than a schema**: subagent output is parsed leniently (fences stripped, the first balanced block taken). A parse failure degrades to "no findings from this step" or "gate not passed", never to a false pass.
+- **Living with pi-multi-account**: switching accounts replaces the session, so the old instance's `agent_settled` may meet a stale context. The extension gives up quietly; the marker stays in `.git/` and the new session's instance gates as usual.
 
-- **标记放 `.git/` 内**：不进工作区、不被 git 跟踪（沿用原版纪律）；无 `.git` 时退回 `.pi/`。
-- **收工拦截用 `agent_settled` + followUp 注入**而非硬 block：pi 的事件模型里"拦停收工"即
-  "再起一轮"，语义一致且不会与 auto-compact/重试打架。
-- **30 分钟陈旧豁免**：会话崩溃残留的标记不拦人（沿用原版）。
-- **JSON-in-text 而非 schema**：子代理输出解析宽容一层（剥围栏、取平衡块），
-  解析失败按"该站零发现/门禁未过"降级，不会误杀。
+## License
+
+[MIT](LICENSE).

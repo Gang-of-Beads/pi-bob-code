@@ -1,5 +1,6 @@
-// pi-bob-code：Bob 五站流水线（侦察 → 对抗验证 → 修复 → 门禁）的 pi 扩展
-// 改编自 Kingo digitaltwin 项目的 .claude bob 套件，通用化：仓库路径/命令/代理均可由 bob.config.json 配置。
+// pi-bob-code: a pi extension that puts every code change through a five-step pipeline
+// (scout → adversarial verification → fix → gate → report) before the agent may finish.
+// Repository paths, the gate command and the subagents come from bob.config.json.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
@@ -10,16 +11,16 @@ const EDIT_TOOLS = new Set(["write", "edit", "apply_patch", "multiedit"]);
 const STALE_MS = 30 * 60 * 1000;
 
 type BobConfig = {
-  srcPaths: string[];        // 视为"源码"的路径前缀，碰到即埋 pending 标记
-  verifyCommand: string;     // 门禁命令（QA 站与人工复核都用它）
-  scoutAgent: string;        // 侦察/对抗验证子代理
-  fixerAgent: string;        // 修复者子代理（需要写权限）
-  qaAgent: string;           // 门禁子代理（需要 bash）
-  maxFindings: number;       // 进入对抗验证的发现上限
-  chunkSize: number;         // 清洁站每路通读的文件数
-  anchorsPath?: string;      // 变异锚点文件（存在则修复必须逐字保留）
-  archRules?: string;        // 架构不变量（写进验证/修复的铁律）
-  extraWriteTools?: string[];// 额外视为写文件的工具名
+  srcPaths: string[];        // path prefixes that count as source; an edit under one sets the pending marker
+  verifyCommand: string;     // the gate command (run by the QA step and again by the main session)
+  scoutAgent: string;        // subagent for scouting and adversarial verification
+  fixerAgent: string;        // subagent that applies fixes (needs write access)
+  qaAgent: string;           // subagent that runs the gate (needs bash)
+  maxFindings: number;       // how many findings go on to adversarial verification
+  chunkSize: number;         // files each cleanliness scout reads
+  anchorsPath?: string;      // mutation-anchor file; when present, fixes must keep its lines verbatim
+  archRules?: string;        // architecture invariants, written into the verify and fix rules
+  extraWriteTools?: string[];// further tool names that count as writing a file
 };
 
 const DEFAULTS: BobConfig = {
@@ -36,20 +37,20 @@ function loadConfig(cwd: string): BobConfig {
   const cfg: Partial<BobConfig> = {};
   for (const p of [join(cwd, "bob.config.json"), join(cwd, ".pi", "bob.config.json")]) {
     if (existsSync(p)) {
-      try { Object.assign(cfg, JSON.parse(readFileSync(p, "utf8"))); break; } catch { /* 坏配置就用默认 */ }
+      try { Object.assign(cfg, JSON.parse(readFileSync(p, "utf8"))); break; } catch { /* a broken config falls back to the defaults */ }
     }
   }
   return { ...DEFAULTS, ...cfg };
 }
 
 function markerPath(cwd: string, name: string): string {
-  // 标记放 .git/ 内：不进工作区、不被 git 跟踪；无 .git 时退回 .pi/
+  // Markers live inside .git/: outside the working tree and never tracked. Without .git, fall back to .pi/.
   const dir = existsSync(join(cwd, ".git")) ? join(cwd, ".git") : join(cwd, ".pi");
   return join(dir, name);
 }
 
 function markPending(cwd: string) {
-  try { writeFileSync(markerPath(cwd, "bob-pending"), String(Date.now())); } catch { /* 只读盘等极端情况静默 */ }
+  try { writeFileSync(markerPath(cwd, "bob-pending"), String(Date.now())); } catch { /* read-only disk and similar: stay silent */ }
 }
 
 function pendingState(cwd: string): "none" | "pending" | "running" {
@@ -57,7 +58,7 @@ function pendingState(cwd: string): "none" | "pending" | "running" {
   try {
     if (existsSync(runningP)) {
       const mtime = Number(readFileSync(runningP, "utf8")) || 0;
-      if (Date.now() - mtime < STALE_MS) return "running"; // 流水线在跑，放行收工
+      if (Date.now() - mtime < STALE_MS) return "running"; // the pipeline is running: let the session finish
     }
   } catch { /* fallthrough */ }
   return existsSync(markerPath(cwd, "bob-pending")) ? "pending" : "none";
@@ -65,7 +66,7 @@ function pendingState(cwd: string): "none" | "pending" | "running" {
 
 function clearMarkers(cwd: string) {
   for (const n of ["bob-pending", "bob-running"]) {
-    try { unlinkSync(markerPath(cwd, n)); } catch { /* 不存在即目标态 */ }
+    try { unlinkSync(markerPath(cwd, n)); } catch { /* already gone is the goal */ }
   }
 }
 
@@ -78,49 +79,50 @@ function workflowFilePath(): string {
   return join(dirname(fileURLToPath(import.meta.url)), "..", "workflows", "bob-pipeline.js");
 }
 
-const BOB_PROMPT = (wf: string, verify: string) => `对当前编码改动跑 bob 五站流水线。按序执行：
+const BOB_PROMPT = (wf: string, verify: string) => `Run the bob five-step pipeline on the current code changes, in this order:
 
-1. 侦察（inline，自己动手，不 spawn）：\`git status --short\` + \`git diff --stat HEAD\`（含已暂存）得到改动文件；工作区干净时改用 \`git diff --name-only \$(git merge-base HEAD main)\` 看未体检的提交，基点写进 base。从改动测试标题提取 AC 标签（正则 AC-\\d+）填入 acs，没有则空数组。降级判定：凡本轮编辑过 src/ 一律走流水线；仅纯文档/配置且 ≤2 文件可降级为直接跑 \`${verify}\` 并汇报即止。
-2. 启动流水线：先 \`touch .git/bob-running\`（30 分钟自动视为陈旧），然后调用 subagent 工具：workflowScriptPath: "${wf}"，args: { files, srcFiles, testFiles, acs, base }。流水线运行期间同步等待，不要空收工。
-3. 汇报：确认了什么/反驳了什么/修了什么/门禁结果（表格），deferred 发现按严重度列出。
-4. 独立复核：自己重跑一遍 \`${verify}\`（与流水线 QA 互为第二票），一致才可信。
-5. 收尾：删除 .git/bob-pending 与 .git/bob-running，再收工。`;
+1. Scout (inline, yourself, no subagent): \`git status --short\` plus \`git diff --stat HEAD\` (staged changes included) give the changed files. If the working tree is clean, use \`git diff --name-only \$(git merge-base HEAD main)\` to see unchecked commits and put that base in \`base\`. Collect AC tags (regex AC-\\d+) from the titles of changed tests into \`acs\`, or an empty array. Shortcut: any edit under src/ this round goes through the pipeline; only a change of at most 2 files that is purely docs or config may skip it, by running \`${verify}\` directly and reporting.
+2. Start the pipeline: first \`touch .git/bob-running\` (treated as stale after 30 minutes), then call the subagent tool with workflowScriptPath: "${wf}" and args: { files, srcFiles, testFiles, acs, base }. Wait for the pipeline while it runs; do not finish with nothing to show.
+3. Report: what was confirmed, refuted and fixed, and the gate result (a table); list deferred findings by severity.
+4. Check independently: run \`${verify}\` again yourself (a second vote beside the pipeline's QA). Only agreement counts.
+5. Wrap up: delete .git/bob-pending and .git/bob-running, then finish.`;
 
 export default function (pi: ExtensionAPI) {
   let cwdCache = "";
 
   const cfgFor = (ctx: any): BobConfig => loadConfig(ctx.cwd || cwdCache || process.cwd());
 
-  // ① 写工具落盘即埋标记（替代 Claude Code 的 PostToolUse hook）
+  // 1. A write tool that touches a watched path sets the pending marker.
   pi.on("tool_call", async (event, ctx) => {
     cwdCache = ctx.cwd || cwdCache;
     if (!EDIT_TOOLS.has(event.toolName) && !(cfgFor(ctx).extraWriteTools ?? []).includes(event.toolName)) return;
     const input: any = event.input ?? {};
     const p: string = input.file_path ?? input.path ?? input.filePath ?? "";
     if (touchesWatchedPath(cfgFor(ctx), p)) markPending(ctx.cwd || process.cwd());
-    return; // 不拦截，只记录
+    return; // record only, never block the call
   });
 
-  // ② 收工拦截：有未体检改动 → 注入 /bob 指令（替代 Stop hook 的 block）
-  //   pi-multi-account 等扩展替换会话后本实例会 stale：静默降级，标记留给新会话的新实例自愈。
+  // 2. The finish gate: unchecked changes inject the pipeline instructions as a follow-up turn.
+  //    When another extension (pi-multi-account, for one) replaces the session, this instance is stale:
+  //    give up quietly and leave the marker for the new session's instance.
   pi.on("agent_settled", async (_event, ctx) => {
     const cwd = ctx.cwd || cwdCache || process.cwd();
     if (pendingState(cwd) !== "pending") return;
     const cfg = cfgFor(ctx);
     try {
       await pi.sendUserMessage(
-      `收工被 bob 门禁拦下：工作区有未体检的编码改动（本轮编辑过 ${cfg.srcPaths.join(" 或 ")}）。不得以死代码/无行为变更为由跳过。\n\n` +
+      `The bob gate stopped this finish: the working tree has unchecked code changes (this round edited ${cfg.srcPaths.join(" or ")}). Do not skip it because the code is dead or the behaviour is unchanged.\n\n` +
       BOB_PROMPT(workflowFilePath(), cfg.verifyCommand),
       { deliverAs: "followUp", triggerTurn: true } as any,
       );
     } catch (e) {
-      if (!String(e).includes("stale")) throw e; // stale = 会话已换代，新实例接管
+      if (!String(e).includes("stale")) throw e; // stale: the session was replaced and its new instance takes over
     }
   });
 
-  // ③ /bob 命令：手动触发体检
+  // 3. /bob: run the pipeline by hand.
   pi.registerCommand("bob", {
-    description: "Bob 五站流水线体检当前编码改动（侦察→对抗验证→修复→门禁）",
+    description: "Run the bob five-step pipeline on the current code changes (scout → verify → fix → gate)",
     handler: async (_args, ctx) => {
       const cfg = cfgFor(ctx);
       try {
@@ -130,17 +132,17 @@ export default function (pi: ExtensionAPI) {
         } as any);
       } catch (e) {
         if (!String(e).includes("stale")) throw e;
-        ctx.ui.notify("会话已换代，请在新会话里重跑 /bob", "warning");
+        ctx.ui.notify("The session was replaced; run /bob again in the new session", "warning");
       }
     },
   });
 
-  // ④ 逃生舱：跳过门禁清标记（用户明确豁免时用）
+  // 4. Escape hatch: clear the markers when the user explicitly waives this round's check.
   pi.registerCommand("bob-done", {
-    description: "清掉 bob-pending/bob-running 标记（明确豁免本轮体检）",
+    description: "Clear the bob-pending and bob-running markers (explicitly waive this round's check)",
     handler: async (_args, ctx) => {
       clearMarkers(ctx.cwd || process.cwd());
-      await pi.sendUserMessage("bob 标记已清除，本轮体检豁免。", { triggerTurn: true } as any);
+      await pi.sendUserMessage("bob markers cleared; this round's check is waived.", { triggerTurn: true } as any);
     },
   });
 }
