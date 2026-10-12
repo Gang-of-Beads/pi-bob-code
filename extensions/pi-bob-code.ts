@@ -53,6 +53,35 @@ function markPending(cwd: string) {
   try { writeFileSync(markerPath(cwd, "bob-pending"), String(Date.now())); } catch { /* read-only disk and similar: stay silent */ }
 }
 
+/** What was already delivered, as `<generation>\t<session>`: one injection per change. */
+function injectedKey(cwd: string): string {
+  try { return readFileSync(markerPath(cwd, "bob-injected"), "utf8"); } catch { return ""; }
+}
+
+function markInjected(cwd: string, generation: string, session: string): void {
+  try { writeFileSync(markerPath(cwd, "bob-injected"), `${generation}\t${session}`); } catch { /* as above */ }
+}
+
+function pendingGeneration(cwd: string): string | undefined {
+  try { return readFileSync(markerPath(cwd, "bob-pending"), "utf8").trim() || undefined; } catch { return undefined; }
+}
+
+/**
+ * Whether this settle should inject, or stay quiet.
+ *
+ * Injecting on every settle while the marker exists was the original behaviour, and it loops:
+ * one interrupted turn leaves the marker, the next settle injects the same instruction again,
+ * and it reads as a gate that cannot be stopped while every copy costs a whole turn. The
+ * record is keyed on the change generation and the session, so one change tells one session
+ * once. Another session still gets told - the one able to run the pipeline is not necessarily
+ * the one that settled, since a subagent writes files too and has no subagent tool.
+ */
+function shouldInject(cwd: string, session: string): boolean {
+  const generation = pendingGeneration(cwd);
+  if (!generation) return false;
+  return injectedKey(cwd) !== `${generation}\t${session}`;
+}
+
 function pendingState(cwd: string): "none" | "pending" | "running" {
   const runningP = markerPath(cwd, "bob-running");
   try {
@@ -65,7 +94,7 @@ function pendingState(cwd: string): "none" | "pending" | "running" {
 }
 
 function clearMarkers(cwd: string) {
-  for (const n of ["bob-pending", "bob-running"]) {
+  for (const n of ["bob-pending", "bob-running", "bob-injected"]) {
     try { unlinkSync(markerPath(cwd, n)); } catch { /* already gone is the goal */ }
   }
 }
@@ -82,10 +111,12 @@ function workflowFilePath(): string {
 const BOB_PROMPT = (wf: string, verify: string) => `Run the bob five-step pipeline on the current code changes, in this order:
 
 1. Scout (inline, yourself, no subagent): \`git status --short\` plus \`git diff --stat HEAD\` (staged changes included) give the changed files. If the working tree is clean, use \`git diff --name-only \$(git merge-base HEAD main)\` to see unchecked commits and put that base in \`base\`. Collect AC tags (regex AC-\\d+) from the titles of changed tests into \`acs\`, or an empty array. Shortcut: any edit under src/ this round goes through the pipeline; only a change of at most 2 files that is purely docs or config may skip it, by running \`${verify}\` directly and reporting.
-2. Start the pipeline: first \`touch .git/bob-running\` (treated as stale after 30 minutes), then call the subagent tool with workflowScriptPath: "${wf}" and args: { files, srcFiles, testFiles, acs, base }. Wait for the pipeline while it runs; do not finish with nothing to show.
+2. Start the pipeline: first \`touch .git/bob-running\` (treated as stale after 30 minutes), then call the subagent tool with workflow: "${wf}" and args: { files, srcFiles, testFiles, acs, base }. Wait for the pipeline while it runs; do not finish with nothing to show.
 3. Report: what was confirmed, refuted and fixed, and the gate result (a table); list deferred findings by severity.
 4. Check independently: run \`${verify}\` again yourself (a second vote beside the pipeline's QA). Only agreement counts.
-5. Wrap up: delete .git/bob-pending and .git/bob-running, then finish.`;
+5. Wrap up: delete .git/bob-pending and .git/bob-running, then finish.
+
+If this session has no \`subagent\` tool - a subagent session has none - do not keep asking: the \`touch .git/bob-running\` above already silences the gate, so just run \`${verify}\` once and leave the markers of this change to the session that can run the pipeline.`;
 
 export default function (pi: ExtensionAPI) {
   let cwdCache = "";
@@ -108,7 +139,10 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_settled", async (_event, ctx) => {
     const cwd = ctx.cwd || cwdCache || process.cwd();
     if (pendingState(cwd) !== "pending") return;
+    const session = String(ctx.sessionManager?.getSessionId?.() ?? process.pid);
+    if (!shouldInject(cwd, session)) return;
     const cfg = cfgFor(ctx);
+    markInjected(cwd, pendingGeneration(cwd)!, session);
     try {
       await pi.sendUserMessage(
       `The bob gate stopped this finish: the working tree has unchecked code changes (this round edited ${cfg.srcPaths.join(" or ")}). Do not skip it because the code is dead or the behaviour is unchanged.\n\n` +
@@ -125,6 +159,9 @@ export default function (pi: ExtensionAPI) {
     description: "Run the bob five-step pipeline on the current code changes (scout → verify → fix → gate)",
     handler: async (_args, ctx) => {
       const cfg = cfgFor(ctx);
+      const session = String(ctx.sessionManager?.getSessionId?.() ?? process.pid);
+      const generation = pendingGeneration(ctx.cwd);
+      if (generation) markInjected(ctx.cwd, generation, session);
       try {
         await pi.sendUserMessage(BOB_PROMPT(workflowFilePath(), cfg.verifyCommand), {
           deliverAs: "followUp",
