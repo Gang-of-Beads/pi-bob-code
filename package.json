@@ -1,6 +1,6 @@
 {
   "name": "pi-bob-code",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A pi extension that gates every code change behind a five-step review pipeline: scout, adversarial verification, fix, gate, report.",
   "keywords": [
     "pi-package",
