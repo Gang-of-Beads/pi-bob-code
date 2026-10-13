@@ -7,6 +7,7 @@ A [pi](https://github.com/earendil-works/pi) extension that puts every code chan
 ```
 An edit under srcPaths ──→ sets the .git/bob-pending marker
 The agent tries to finish (agent_settled) ──marker found──→ stopped; the pipeline instructions are injected
+  (only when the run completed: a run the user stopped, or one that ended in a provider error, is left alone)
 The bob pipeline (a pi-subagents workflow, workflows/bob-pipeline.js):
   1. Scout      parallel read-only reviews: spec (do the test assertions keep their promise),
                 cleanliness (chunkSize files each), hardening (only when the change touches writePaths)
@@ -90,9 +91,16 @@ Found over several weeks of daily use on PI WEB, and not fixed yet:
 
 - **Markers live in `.git/`**: outside the working tree and never tracked. Without `.git`, they fall back to `.pi/`.
 - **The gate is an `agent_settled` handler that injects a follow-up turn** rather than a hard block: in pi's event model, stopping a finish means starting another turn, which keeps it out of the way of auto-compaction and retries.
+- **Stop means stop**: when the run settled because the user aborted it (`agent_settled`'s `aborted`, or a last assistant message with stop reason `aborted`), the gate neither injects nor records an injection. A run that ended in a provider error is treated the same way: pi has already spent its automatic retries, and an injected turn would most likely fail again and use up this change's one injection. The marker stays, so the next completed finish is gated once.
 - **A 30-minute staleness window**: markers left behind by a crashed session stop gating after half an hour.
 - **JSON in text rather than a schema**: subagent output is parsed leniently (fences stripped, the first balanced block taken). A parse failure degrades to "no findings from this step" or "gate not passed", never to a false pass.
 - **Living with pi-multi-account**: switching accounts replaces the session, so the old instance's `agent_settled` may meet a stale context. The extension gives up quietly; the marker stays in `.git/` and the new session's instance gates as usual.
+
+## Development
+
+```bash
+npx jiti test/agent-settled.test.ts
+```
 
 ## License
 

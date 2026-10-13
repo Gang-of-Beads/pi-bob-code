@@ -2,7 +2,6 @@
 // (scout → adversarial verification → fix → gate → report) before the agent may finish.
 // Repository paths, the gate command and the subagents come from bob.config.json.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -82,6 +81,28 @@ function shouldInject(cwd: string, session: string): boolean {
   return injectedKey(cwd) !== `${generation}\t${session}`;
 }
 
+type SettleOutcome = "completed" | "aborted" | "error";
+
+/**
+ * Why the run settled. Only a completed run is a finish the gate may stop.
+ *
+ * An abort is the user pressing Stop. Injecting there made Stop start a new turn, so content
+ * kept pouring in after the user interrupted (owner report, 2026-10-13). A provider error has
+ * already used up pi's automatic retries; an injected turn would most likely fail the same way
+ * and spend this change's one injection on nothing. Neither injects nor records an injection:
+ * the marker stays, and the next completed finish is gated once as usual.
+ */
+function settleOutcome(aborted: boolean | undefined, lastStopReason: string | undefined): SettleOutcome {
+  if (aborted || lastStopReason === "aborted") return "aborted";
+  return lastStopReason === "error" ? "error" : "completed";
+}
+
+function lastAssistantStopReason(ctx: any): string | undefined {
+  const branch: any[] = ctx.sessionManager?.getBranch?.() ?? [];
+  const entry = [...branch].reverse().find((e) => e?.type === "message" && e.message?.role === "assistant");
+  return entry?.message.stopReason;
+}
+
 function pendingState(cwd: string): "none" | "pending" | "running" {
   const runningP = markerPath(cwd, "bob-running");
   try {
@@ -136,7 +157,8 @@ export default function (pi: ExtensionAPI) {
   // 2. The finish gate: unchecked changes inject the pipeline instructions as a follow-up turn.
   //    When another extension (pi-multi-account, for one) replaces the session, this instance is stale:
   //    give up quietly and leave the marker for the new session's instance.
-  pi.on("agent_settled", async (_event, ctx) => {
+  pi.on("agent_settled", async (event, ctx) => {
+    if (settleOutcome(event.aborted, lastAssistantStopReason(ctx)) !== "completed") return;
     const cwd = ctx.cwd || cwdCache || process.cwd();
     if (pendingState(cwd) !== "pending") return;
     const session = String(ctx.sessionManager?.getSessionId?.() ?? process.pid);
