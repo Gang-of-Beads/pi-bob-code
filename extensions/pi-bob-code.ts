@@ -42,27 +42,26 @@ function loadConfig(cwd: string): BobConfig {
   return { ...DEFAULTS, ...cfg };
 }
 
-function markerPath(cwd: string, name: string): string {
-  // Markers live inside .git/: outside the working tree and never tracked. Without .git, fall back to .pi/.
-  const dir = existsSync(join(cwd, ".git")) ? join(cwd, ".git") : join(cwd, ".pi");
-  return join(dir, name);
+/** Where the markers live: inside .git/, outside the working tree and never tracked; without .git, .pi/. */
+function markerDir(cwd: string): string {
+  return existsSync(join(cwd, ".git")) ? join(cwd, ".git") : join(cwd, ".pi");
 }
 
-function markPending(cwd: string) {
-  try { writeFileSync(markerPath(cwd, "bob-pending"), String(Date.now())); } catch { /* read-only disk and similar: stay silent */ }
+function markPending(dir: string) {
+  try { writeFileSync(join(dir, "bob-pending"), String(Date.now())); } catch { /* read-only disk and similar: stay silent */ }
 }
 
 /** What was already delivered, as `<generation>\t<session>`: one injection per change. */
-function injectedKey(cwd: string): string {
-  try { return readFileSync(markerPath(cwd, "bob-injected"), "utf8"); } catch { return ""; }
+function injectedKey(dir: string): string {
+  try { return readFileSync(join(dir, "bob-injected"), "utf8"); } catch { return ""; }
 }
 
-function markInjected(cwd: string, generation: string, session: string): void {
-  try { writeFileSync(markerPath(cwd, "bob-injected"), `${generation}\t${session}`); } catch { /* as above */ }
+function markInjected(dir: string, generation: string, session: string): void {
+  try { writeFileSync(join(dir, "bob-injected"), `${generation}\t${session}`); } catch { /* as above */ }
 }
 
-function pendingGeneration(cwd: string): string | undefined {
-  try { return readFileSync(markerPath(cwd, "bob-pending"), "utf8").trim() || undefined; } catch { return undefined; }
+function pendingGeneration(dir: string): string | undefined {
+  try { return readFileSync(join(dir, "bob-pending"), "utf8").trim() || undefined; } catch { return undefined; }
 }
 
 /**
@@ -75,10 +74,10 @@ function pendingGeneration(cwd: string): string | undefined {
  * once. Another session still gets told - the one able to run the pipeline is not necessarily
  * the one that settled, since a subagent writes files too and has no subagent tool.
  */
-function shouldInject(cwd: string, session: string): boolean {
-  const generation = pendingGeneration(cwd);
+function shouldInject(dir: string, session: string): boolean {
+  const generation = pendingGeneration(dir);
   if (!generation) return false;
-  return injectedKey(cwd) !== `${generation}\t${session}`;
+  return injectedKey(dir) !== `${generation}\t${session}`;
 }
 
 type SettleOutcome = "completed" | "aborted" | "error";
@@ -103,20 +102,20 @@ function lastAssistantStopReason(ctx: any): string | undefined {
   return entry?.message.stopReason;
 }
 
-function pendingState(cwd: string): "none" | "pending" | "running" {
-  const runningP = markerPath(cwd, "bob-running");
+function pendingState(dir: string): "none" | "pending" | "running" {
+  const runningP = join(dir, "bob-running");
   try {
     if (existsSync(runningP)) {
       const mtime = Number(readFileSync(runningP, "utf8")) || 0;
       if (Date.now() - mtime < STALE_MS) return "running"; // the pipeline is running: let the session finish
     }
   } catch { /* fallthrough */ }
-  return existsSync(markerPath(cwd, "bob-pending")) ? "pending" : "none";
+  return existsSync(join(dir, "bob-pending")) ? "pending" : "none";
 }
 
-function clearMarkers(cwd: string) {
+function clearMarkers(dir: string) {
   for (const n of ["bob-pending", "bob-running", "bob-injected"]) {
-    try { unlinkSync(markerPath(cwd, n)); } catch { /* already gone is the goal */ }
+    try { unlinkSync(join(dir, n)); } catch { /* already gone is the goal */ }
   }
 }
 
@@ -141,16 +140,31 @@ If this session has no \`subagent\` tool - a subagent session has none - do not 
 
 export default function (pi: ExtensionAPI) {
   let cwdCache = "";
+  // Resolved once per cwd: tool_call runs on every write and would otherwise re-read the config
+  // and re-probe .git on every call.
+  const resolved = new Map<string, { cfg: BobConfig; markerDir: string }>();
 
-  const cfgFor = (ctx: any): BobConfig => loadConfig(ctx.cwd || cwdCache || process.cwd());
+  const cwdOf = (ctx: any): string => {
+    cwdCache = ctx?.cwd || cwdCache || process.cwd();
+    return cwdCache;
+  };
+
+  const forCwd = (cwd: string) => {
+    let r = resolved.get(cwd);
+    if (!r) {
+      r = { cfg: loadConfig(cwd), markerDir: markerDir(cwd) };
+      resolved.set(cwd, r);
+    }
+    return r;
+  };
 
   // 1. A write tool that touches a watched path sets the pending marker.
   pi.on("tool_call", async (event, ctx) => {
-    cwdCache = ctx.cwd || cwdCache;
-    if (!EDIT_TOOLS.has(event.toolName) && !(cfgFor(ctx).extraWriteTools ?? []).includes(event.toolName)) return;
+    const { cfg, markerDir } = forCwd(cwdOf(ctx));
+    if (!EDIT_TOOLS.has(event.toolName) && !(cfg.extraWriteTools ?? []).includes(event.toolName)) return;
     const input: any = event.input ?? {};
     const p: string = input.file_path ?? input.path ?? input.filePath ?? "";
-    if (touchesWatchedPath(cfgFor(ctx), p)) markPending(ctx.cwd || process.cwd());
+    if (touchesWatchedPath(cfg, p)) markPending(markerDir);
     return; // record only, never block the call
   });
 
@@ -159,12 +173,11 @@ export default function (pi: ExtensionAPI) {
   //    give up quietly and leave the marker for the new session's instance.
   pi.on("agent_settled", async (event, ctx) => {
     if (settleOutcome(event.aborted, lastAssistantStopReason(ctx)) !== "completed") return;
-    const cwd = ctx.cwd || cwdCache || process.cwd();
-    if (pendingState(cwd) !== "pending") return;
+    const { cfg, markerDir } = forCwd(cwdOf(ctx));
+    if (pendingState(markerDir) !== "pending") return;
     const session = String(ctx.sessionManager?.getSessionId?.() ?? process.pid);
-    if (!shouldInject(cwd, session)) return;
-    const cfg = cfgFor(ctx);
-    markInjected(cwd, pendingGeneration(cwd)!, session);
+    if (!shouldInject(markerDir, session)) return;
+    markInjected(markerDir, pendingGeneration(markerDir)!, session);
     try {
       await pi.sendUserMessage(
       `The bob gate stopped this finish: the working tree has unchecked code changes (this round edited ${cfg.srcPaths.join(" or ")}). Do not skip it because the code is dead or the behaviour is unchanged.\n\n` +
@@ -180,10 +193,10 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("bob", {
     description: "Run the bob five-step pipeline on the current code changes (scout → verify → fix → gate)",
     handler: async (_args, ctx) => {
-      const cfg = cfgFor(ctx);
+      const { cfg, markerDir } = forCwd(cwdOf(ctx));
       const session = String(ctx.sessionManager?.getSessionId?.() ?? process.pid);
-      const generation = pendingGeneration(ctx.cwd);
-      if (generation) markInjected(ctx.cwd, generation, session);
+      const generation = pendingGeneration(markerDir);
+      if (generation) markInjected(markerDir, generation, session);
       try {
         await pi.sendUserMessage(BOB_PROMPT(workflowFilePath(), cfg.verifyCommand), {
           deliverAs: "followUp",
@@ -200,7 +213,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("bob-done", {
     description: "Clear the bob-pending and bob-running markers (explicitly waive this round's check)",
     handler: async (_args, ctx) => {
-      clearMarkers(ctx.cwd || process.cwd());
+      clearMarkers(forCwd(cwdOf(ctx)).markerDir);
       await pi.sendUserMessage("bob markers cleared; this round's check is waived.", { triggerTurn: true } as any);
     },
   });
