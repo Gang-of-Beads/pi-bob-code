@@ -23,6 +23,6 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
-      - run: npm install --no-audit --no-fund --no-save @earendil-works/pi-coding-agent @types/node
+      - run: npm install --no-audit --no-fund --no-save @earendil-works/pi-coding-agent @types/node typescript
       - run: npx tsc --noEmit --strict --skipLibCheck --allowImportingTsExtensions --target es2022 --module nodenext --moduleResolution nodenext --types node extensions/pi-bob-code.ts test/*.test.ts
       - run: node --test test/*.test.ts
